@@ -3,14 +3,16 @@ package com.safepulse.ui.components
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -21,8 +23,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -30,17 +34,15 @@ import androidx.core.content.ContextCompat
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.model.LatLng
 import com.google.maps.android.PolyUtil
-import com.safepulse.ui.map.CircleData
+import com.safepulse.ui.map.CrimeZoneData
 import com.safepulse.ui.map.LeafletMapController
 import com.safepulse.ui.map.LeafletMapView
 import com.safepulse.ui.map.MapUpdateData
 import com.safepulse.ui.map.MarkerData
-import com.safepulse.ui.map.PolylineData
 import com.safepulse.data.db.entity.HotspotEntity
-import com.safepulse.data.repository.DisasterRepository
-import com.safepulse.data.repository.HotspotRepository
 import com.safepulse.data.repository.RiskZoneRepository
-import com.safepulse.data.repository.SafeRoutesRepository
+import com.safepulse.domain.riskmap.SafeRouteOption
+import com.safepulse.domain.riskmap.SafetyPlaceType
 import com.safepulse.domain.saferoutes.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -49,6 +51,31 @@ import kotlinx.coroutines.withContext
 /**
  * Expandable live map component with integrated route planning
  */
+private enum class NearbyMapCategory { ALL, POLICE, HOSPITAL }
+
+private data class MapNearbySafetyItem(
+    val id: String,
+    val name: String,
+    val category: NearbyMapCategory,
+    val location: LatLng,
+    val distanceKm: Double,
+    val riskScore: Float,
+    val riskLabel: String,
+    val subtitle: String = "",
+    val phoneNumber: String = ""
+)
+
+private data class MapSelectedSafetyDetail(
+    val item: MapNearbySafetyItem,
+    val safestRoute: SafeRouteOption?,
+    val recommendation: VehicleRecommendation
+)
+
+private data class NearbyMapLoadResult(
+    val items: List<MapNearbySafetyItem>,
+    val crimeZones: List<CrimeZoneData>
+)
+
 @Composable
 fun LiveMapCard(
     currentLocation: com.google.android.gms.maps.model.LatLng?,
@@ -61,12 +88,20 @@ fun LiveMapCard(
     var mapController: LeafletMapController? by remember { mutableStateOf(null) }
     val context = LocalContext.current
 
-    // Route planning state
-    var showSearchDialog by remember { mutableStateOf(false) }
-    var isLoadingRoutes by remember { mutableStateOf(false) }
-    var routes by remember { mutableStateOf<List<SafeRoute>>(emptyList()) }
-    var selectedRoute by remember { mutableStateOf<SafeRoute?>(null) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var nearbyItems by remember { mutableStateOf<List<MapNearbySafetyItem>>(emptyList()) }
+    var nearbyLoading by remember { mutableStateOf(false) }
+    var nearbyError by remember { mutableStateOf<String?>(null) }
+    var selectedNearbyCategory by remember { mutableStateOf<NearbyMapCategory?>(null) }
+    var selectedNearbyDetail by remember { mutableStateOf<MapSelectedSafetyDetail?>(null) }
+    var crimeZonesForRoutes by remember { mutableStateOf<List<CrimeZoneData>>(emptyList()) }
+
+    val filteredNearbyItems = remember(nearbyItems, selectedNearbyCategory) {
+        when (selectedNearbyCategory) {
+            null -> emptyList()
+            NearbyMapCategory.ALL -> nearbyItems
+            else -> nearbyItems.filter { it.category == selectedNearbyCategory }
+        }
+    }
 
     val hasLocationPermission = ContextCompat.checkSelfPermission(
         context,
@@ -83,45 +118,48 @@ fun LiveMapCard(
     }
 
     // Update map markers when data changes
-    LaunchedEffect(crimeHotspots, disasters, currentLocation, routes, selectedRoute) {
+    LaunchedEffect(
+        currentLocation,
+        filteredNearbyItems,
+        selectedNearbyDetail,
+        crimeZonesForRoutes
+    ) {
         mapController?.let { controller ->
-            updateLeafletContent(controller, crimeHotspots, disasters, currentLocation, routes, selectedRoute)
+            updateLeafletContent(
+                controller,
+                currentLocation,
+                filteredNearbyItems,
+                selectedNearbyDetail?.item
+            )
+            val selectedItem = selectedNearbyDetail?.item
+            if (currentLocation != null && selectedItem != null) {
+                controller.drawSafeRoute(currentLocation, selectedItem.location, crimeZonesForRoutes)
+                controller.fitBounds(listOf(currentLocation, selectedItem.location))
+            }
         }
     }
 
-    // Load bounded nearby map layers. Full-India hospital/police layers are too heavy for WebView.
-    LaunchedEffect(mapController, currentLocation) {
-        val ctrl = mapController ?: return@LaunchedEffect
-        val center = currentLocation ?: LatLng(28.6139, 77.2090)
-        val repo = RiskZoneRepository(context)
-        val stations = withContext(Dispatchers.IO) {
-            repo.getPoliceStationsNear(center, 30.0).take(MAX_LAYER_MARKERS)
-        }
-        val hospitals = withContext(Dispatchers.IO) {
-            repo.getHospitalsNear(center, 20.0).take(MAX_LAYER_MARKERS)
-        }
-        val safeZones = withContext(Dispatchers.IO) {
-            repo.getSafeZonesNear(center, 50.0).take(MAX_SAFE_ZONE_MARKERS)
-        }
-        if (stations.isNotEmpty()) {
-            ctrl.addPoliceStations(stations)
-        }
-        if (hospitals.isNotEmpty()) {
-            ctrl.addHospitals(hospitals)
-        }
-        if (safeZones.isNotEmpty()) {
-            ctrl.addSafeZones(safeZones)
+    LaunchedEffect(currentLocation) {
+        val location = currentLocation ?: return@LaunchedEffect
+        nearbyLoading = true
+        nearbyError = null
+        selectedNearbyDetail = null
+        try {
+            val result = withContext(Dispatchers.IO) {
+                loadNearbySafetyForMap(context, location)
+            }
+            nearbyItems = result.items
+            crimeZonesForRoutes = result.crimeZones
+        } catch (e: Exception) {
+            nearbyError = e.message ?: "Unable to load nearby safety places"
+        } finally {
+            nearbyLoading = false
         }
     }
 
     if (isExpanded) {
-        // Full screen map with route planning
         Dialog(
-            onDismissRequest = {
-                isExpanded = false
-                routes = emptyList()
-                selectedRoute = null
-            },
+            onDismissRequest = { isExpanded = false },
             properties = DialogProperties(usePlatformDefaultWidth = false)
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
@@ -132,208 +170,74 @@ fun LiveMapCard(
                             controller.setCenter(loc.latitude, loc.longitude, 13f)
                             controller.setCurrentLocation(loc.latitude, loc.longitude)
                         }
-                        updateLeafletContent(controller, crimeHotspots, disasters, currentLocation, routes, selectedRoute)
+                        updateLeafletContent(
+                            controller,
+                            currentLocation,
+                            filteredNearbyItems,
+                            selectedNearbyDetail?.item
+                        )
                     },
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // Top bar with close button
-                Row(
+                IconButton(
+                    onClick = { isExpanded = false },
                     modifier = Modifier
-                        .fillMaxWidth()
+                        .align(Alignment.TopEnd)
                         .padding(16.dp)
-                        .align(Alignment.TopCenter),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                        .background(Color.White, CircleShape)
                 ) {
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.surface
-                    ) {
-                        Text(
-                            text = "Safe Routes",
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    IconButton(
-                        onClick = {
-                            isExpanded = false
-                            routes = emptyList()
-                            selectedRoute = null
-                        },
-                        modifier = Modifier.background(Color.White, CircleShape)
-                    ) {
-                        Icon(Icons.Default.Close, "Close", tint = Color.Black)
-                    }
+                    Icon(Icons.Default.Close, "Close", tint = Color.Black)
                 }
 
-                // Search FAB
-                if (routes.isEmpty()) {
-                    FloatingActionButton(
-                        onClick = { showSearchDialog = true },
-                        modifier = Modifier
-                            .align(Alignment.BottomEnd)
-                            .padding(16.dp)
-                    ) {
-                        Icon(Icons.Default.Search, "Search destination")
-                    }
-                }
-
-                // Route cards
-                if (routes.isNotEmpty()) {
-                    Column(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .padding(16.dp)
-                    ) {
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 300.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(routes) { route ->
-                                RouteCard(
-                                    route = route,
-                                    isSelected = route == selectedRoute,
-                                    onClick = {
-                                        selectedRoute = route
-                                        mapController?.let { controller ->
-                                            updateLeafletContent(controller, crimeHotspots, disasters, currentLocation, routes, route)
-                                            // Zoom to route
-                                            val points = PolyUtil.decode(route.polyline)
-                                            if (points.isNotEmpty()) {
-                                                controller.fitBounds(points)
-                                            }
-                                        }
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Loading indicator
-                if (isLoadingRoutes) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.align(Alignment.Center)
-                    )
-                }
-
-                // Error message
-                errorMessage?.let { error ->
-                    Snackbar(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(16.dp),
-                        action = {
-                            TextButton(onClick = { errorMessage = null }) {
-                                Text("Dismiss")
-                            }
-                        }
-                    ) {
-                        Text(error)
-                    }
-                }
-
-                // Map legend
-                if (routes.isEmpty()) {
-                    MapLegend(
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .padding(16.dp)
-                    )
-                }
-            }
-        }
-
-        // Search dialog
-        if (showSearchDialog) {
-            DestinationSearchDialog(
-                currentLocation = currentLocation,
-                onDismiss = { showSearchDialog = false },
-                onSearch = { destination ->
-                    showSearchDialog = false
-                    if (currentLocation != null) {
-                        scope.launch {
-                            isLoadingRoutes = true
-                            errorMessage = null
-                            try {
-                                android.util.Log.d("LiveMapCard", "Searching from $currentLocation to $destination")
-
-                                // Initialize repositories
-                                val hotspotRepository = HotspotRepository(
-                                    (context.applicationContext as com.safepulse.SafePulseApplication)
-                                        .database.hotspotDao()
-                                )
-                                val riskAnalyzer = RouteRiskAnalyzer(hotspotRepository)
-                                val safeRoutesRepository = SafeRoutesRepository(
-                                    context = context,
-                                    riskAnalyzer = riskAnalyzer
-                                )
-
-                                android.util.Log.d("LiveMapCard", "Fetching routes...")
-                                // Fetch routes
-                                val fetchedRoutes = safeRoutesRepository.getSafeRoutes(currentLocation, destination)
-                                android.util.Log.d("LiveMapCard", "Found ${fetchedRoutes.size} routes")
-
-                                routes = fetchedRoutes
-                                selectedRoute = routes.firstOrNull()
-
-                                if (routes.isEmpty()) {
-                                    errorMessage = "No routes found. Check logs or try TEST MODE."
-                                    android.util.Log.w("LiveMapCard", "No routes returned")
-                                } else {
-                                    android.util.Log.d("LiveMapCard", "Routes: ${routes.joinToString { "${it.distance} - ${it.riskLevel}" }}")
-                                    // Zoom to show routes
-                                    mapController?.let { controller ->
-                                        val allPoints = routes.flatMap { route -> PolyUtil.decode(route.polyline) }
-                                        if (allPoints.isNotEmpty()) {
-                                            controller.fitBounds(allPoints)
-                                        }
-                                    }
+                NearbySafetyMapPanel(
+                    items = filteredNearbyItems,
+                    allItems = nearbyItems,
+                    selectedCategory = selectedNearbyCategory,
+                    selectedDetail = selectedNearbyDetail,
+                    isLoading = nearbyLoading,
+                    error = nearbyError,
+                    hasLocationPermission = hasLocationPermission,
+                    onCategorySelected = {
+                        selectedNearbyCategory = it
+                        selectedNearbyDetail = null
+                        mapController?.clearRoutes()
+                    },
+                    onItemSelected = { item ->
+                        currentLocation?.let { origin ->
+                            scope.launch {
+                                selectedNearbyDetail = null
+                                val detail = withContext(Dispatchers.IO) {
+                                    buildNearbySafetyDetail(context, origin, item, disasters)
                                 }
-                            } catch (e: Exception) {
-                                errorMessage = "API Error: ${e.message}. Try TEST MODE instead."
-                                android.util.Log.e("LiveMapCard", "Route search error", e)
-                                e.printStackTrace()
-                            } finally {
-                                isLoadingRoutes = false
+                                selectedNearbyDetail = detail
+                                mapController?.drawSafeRoute(origin, item.location, crimeZonesForRoutes)
+                                mapController?.fitBounds(listOf(origin, item.location))
                             }
                         }
-                    } else {
-                        errorMessage = "Current location not available"
-                    }
-                },
-                onTestMode = { destination ->
-                    showSearchDialog = false
-                    // Create mock routes without API
-                    android.util.Log.d("LiveMapCard", "TEST MODE: Creating mock routes")
-                    val mockRoutes = createMockRoutesForTest(currentLocation ?: destination, destination)
-                    routes = mockRoutes
-                    selectedRoute = routes.firstOrNull()
-                    android.util.Log.d("LiveMapCard", "TEST MODE: Created ${mockRoutes.size} mock routes")
-
-                    // Zoom to destination
-                    mapController?.animateTo(destination.latitude, destination.longitude,  -13f)
-                }
-            )
+                    },
+                    onClearSelection = {
+                        selectedNearbyDetail = null
+                        mapController?.clearRoutes()
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(16.dp)
+                )
+            }
         }
     }
 
-    // Compact map card
-    Card(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(200.dp)
-            .clickable { isExpanded = true },
-        shape = RoundedCornerShape(16.dp)
-    ) {
-        Box {
+    Column(modifier = modifier.fillMaxWidth()) {
+        // Compact map card
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(200.dp)
+                .clickable { isExpanded = true },
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Box {
             if (hasLocationPermission) {
                 LeafletMapView(
                     onMapReady = { controller ->
@@ -342,7 +246,12 @@ fun LiveMapCard(
                             controller.setCenter(loc.latitude, loc.longitude, 13f)
                             controller.setCurrentLocation(loc.latitude, loc.longitude)
                         }
-                        updateLeafletContent(controller, crimeHotspots, disasters, currentLocation, emptyList(), null)
+                        updateLeafletContent(
+                            controller,
+                            currentLocation,
+                            filteredNearbyItems,
+                            selectedNearbyDetail?.item
+                        )
                     },
                     modifier = Modifier.fillMaxSize()
                 )
@@ -379,7 +288,7 @@ fun LiveMapCard(
                         modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Tap for routes", style = MaterialTheme.typography.labelSmall)
+                    Text("Tap for nearby safety", style = MaterialTheme.typography.labelSmall)
                 }
             }
 
@@ -399,6 +308,7 @@ fun LiveMapCard(
                     MapStat("⚠️", disasters.size.toString(), "Alerts")
                 }
             }
+            }
         }
     }
 
@@ -407,167 +317,334 @@ fun LiveMapCard(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DestinationSearchDialog(
-    currentLocation: com.google.android.gms.maps.model.LatLng?,
-    onDismiss: () -> Unit,
-    onSearch: (com.google.android.gms.maps.model.LatLng) -> Unit,
-    onTestMode: (com.google.android.gms.maps.model.LatLng) -> Unit
+private fun NearbySafetyMapPanel(
+    items: List<MapNearbySafetyItem>,
+    allItems: List<MapNearbySafetyItem>,
+    selectedCategory: NearbyMapCategory?,
+    selectedDetail: MapSelectedSafetyDetail?,
+    isLoading: Boolean,
+    error: String?,
+    hasLocationPermission: Boolean,
+    onCategorySelected: (NearbyMapCategory) -> Unit,
+    onItemSelected: (MapNearbySafetyItem) -> Unit,
+    onClearSelection: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    var customInput by remember { mutableStateOf("") }
-    var isGeocoding by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Search Destination") },
-        text = {
-            Column {
-                Text("Enter any location:", style = MaterialTheme.typography.bodyMedium)
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Custom text input
-                OutlinedTextField(
-                    value = customInput,
-                    onValueChange = {
-                        customInput = it
-                        errorMessage = null
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Place or address") },
-                    placeholder = { Text("e.g., Mumbai Airport") },
-                    singleLine = true,
-                    isError = errorMessage != null,
-                    supportingText = errorMessage?.let { { Text(it, color = MaterialTheme.colorScheme.error) } }
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.VerifiedUser,
+                    contentDescription = null,
+                    tint = Color(0xFF2E7D32),
+                    modifier = Modifier.size(24.dp)
                 )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Quick presets
-                Text("Quick options:", style = MaterialTheme.typography.bodySmall)
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            currentLocation?.let {
-                                onSearch(com.google.android.gms.maps.model.LatLng(
-                                    it.latitude + 0.01,
-                                    it.longitude + 0.01
-                                ))
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("1km", style = MaterialTheme.typography.labelSmall)
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            currentLocation?.let {
-                                onSearch(com.google.android.gms.maps.model.LatLng(
-                                    it.latitude + 0.02,
-                                    it.longitude + 0.02
-                                ))
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("2km", style = MaterialTheme.typography.labelSmall)
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            currentLocation?.let {
-                                onSearch(com.google.android.gms.maps.model.LatLng(
-                                    it.latitude + 0.05,
-                                    it.longitude + 0.05
-                                ))
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("5km", style = MaterialTheme.typography.labelSmall)
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Nearby Safety", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Very-nearby police and hospitals",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                selectedDetail?.let {
+                    IconButton(onClick = onClearSelection) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear route")
                     }
                 }
+            }
 
-                if (isGeocoding) {
-                    Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(12.dp))
+
+            NearbyCategoryRow(
+                selectedCategory = selectedCategory,
+                allItems = allItems,
+                onCategorySelected = onCategorySelected
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            when {
+                !hasLocationPermission -> {
+                    NearbyPanelMessage(
+                        icon = Icons.Default.LocationOff,
+                        text = "Location permission is needed to find nearby safety places."
+                    )
+                }
+                isLoading -> {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Center
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Searching...", style = MaterialTheme.typography.bodySmall)
+                        Text("Finding nearby safety places...", style = MaterialTheme.typography.bodySmall)
                     }
                 }
-            }
-        },
-        confirmButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                // TEST MODE button
-                OutlinedButton(
-                    onClick = {
-                        val testDest = currentLocation?.let {
-                            com.google.android.gms.maps.model.LatLng(it.latitude + 0.02, it.longitude + 0.02)
-                        } ?: com.google.android.gms.maps.model.LatLng(19.0760, 72.8777)
-                        onTestMode(testDest)
+                error != null -> {
+                    NearbyPanelMessage(icon = Icons.Default.Error, text = error)
+                }
+                selectedDetail != null -> {
+                    NearbySelectedDetail(
+                        detail = selectedDetail,
+                        onBack = onClearSelection
+                    )
+                }
+                selectedCategory == null -> {
+                    NearbyPanelMessage(
+                        icon = Icons.Default.TouchApp,
+                        text = "Choose All, Police, or Hospitals to show nearby safety places on the map."
+                    )
+                }
+                items.isEmpty() -> {
+                    NearbyPanelMessage(
+                        icon = Icons.Default.SearchOff,
+                        text = "No nearby safety places found for this category."
+                    )
+                }
+                else -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items.take(3).forEach { item ->
+                            NearbyMapItemRow(item = item, onClick = { onItemSelected(item) })
+                        }
                     }
-                ) {
-                    Text("TEST MODE")
                 }
-
-                // Regular search button
-                Button(
-                    onClick = {
-                        if (customInput.isBlank()) {
-                            errorMessage = "Please enter a location"
-                            return@Button
-                        }
-
-                        scope.launch {
-                            isGeocoding = true
-                            errorMessage = null
-                            try {
-                                android.util.Log.d("DestinationSearch", "Searching for: $customInput")
-                                val geocoder = android.location.Geocoder(context)
-                                val addresses = geocoder.getFromLocationName(customInput, 1)
-
-                                if (!addresses.isNullOrEmpty()) {
-                                    val address = addresses[0]
-                                    android.util.Log.d("DestinationSearch", "Found: ${address.getAddressLine(0)} at ${address.latitude}, ${address.longitude}")
-                                    onSearch(com.google.android.gms.maps.model.LatLng(
-                                        address.latitude,
-                                        address.longitude
-                                    ))
-                                } else {
-                                    errorMessage = "Location not found. Click TEST MODE to see demo routes."
-                                    android.util.Log.w("DestinationSearch", "No results for: $customInput")
-                                }
-                            } catch (e: Exception) {
-                                errorMessage = "Search failed. Click TEST MODE to see demo routes."
-                                android.util.Log.e("DestinationSearch", "Geocoding error for: $customInput", e)
-                            } finally {
-                                isGeocoding = false
-                            }
-                        }
-                    },
-                    enabled = !isGeocoding && customInput.isNotBlank()
-                ) {
-                    Text("Search")
-                }
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
             }
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NearbyCategoryRow(
+    selectedCategory: NearbyMapCategory?,
+    allItems: List<MapNearbySafetyItem>,
+    onCategorySelected: (NearbyMapCategory) -> Unit
+) {
+    val chips = listOf(
+        CategoryChipInfo(NearbyMapCategory.ALL, "All", Icons.Default.Shield),
+        CategoryChipInfo(NearbyMapCategory.POLICE, "Police", Icons.Default.LocalPolice),
+        CategoryChipInfo(NearbyMapCategory.HOSPITAL, "Hospitals", Icons.Default.LocalHospital)
     )
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        chips.forEach { chip ->
+            val count = if (chip.category == NearbyMapCategory.ALL) {
+                allItems.size
+            } else {
+                allItems.count { it.category == chip.category }
+            }
+            FilterChip(
+                selected = selectedCategory == chip.category,
+                onClick = { onCategorySelected(chip.category) },
+                label = { Text("${chip.label} $count", maxLines = 1) },
+                leadingIcon = {
+                    Icon(chip.icon, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+            )
+        }
+    }
+}
+
+private data class CategoryChipInfo(
+    val category: NearbyMapCategory,
+    val label: String,
+    val icon: ImageVector
+)
+
+@Composable
+private fun NearbyMapItemRow(
+    item: MapNearbySafetyItem,
+    onClick: () -> Unit
+) {
+    val (icon, color) = nearbyIconAndColor(item.category)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.72f))
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(38.dp)
+                .clip(CircleShape)
+                .background(color.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(22.dp))
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                item.name,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                "${"%.1f".format(item.distanceKm)} km | Risk ${item.riskLabel}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        RiskTextBadge(item.riskLabel, item.riskScore)
+        Icon(
+            Icons.Default.Route,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+            modifier = Modifier.size(20.dp)
+        )
+    }
+}
+
+@Composable
+private fun NearbySelectedDetail(
+    detail: MapSelectedSafetyDetail,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val item = detail.item
+    val phoneNumber = item.phoneNumber.ifBlank {
+        when (item.category) {
+            NearbyMapCategory.POLICE -> "112"
+            NearbyMapCategory.HOSPITAL -> "108"
+            NearbyMapCategory.ALL -> ""
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack, modifier = Modifier.size(34.dp)) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", modifier = Modifier.size(18.dp))
+            }
+            Spacer(modifier = Modifier.width(6.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(item.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "${"%.1f".format(item.distanceKm)} km away | ${item.riskLabel} risk",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        detail.safestRoute?.let { route ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF2E7D32).copy(alpha = 0.1f))
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Route, contentDescription = null, tint = Color(0xFF2E7D32))
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Safest route", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "${"%.1f".format(route.distanceKm)} km | Risk ${(route.totalRiskScore * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.primaryContainer)
+                .padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.DirectionsCar, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(detail.recommendation.vehicle.displayName, fontWeight = FontWeight.SemiBold)
+                Text(
+                    detail.recommendation.reason,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { openMapNavigation(context, item.location) },
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Navigate")
+            }
+            Button(
+                onClick = { openPhoneDialer(context, phoneNumber) },
+                enabled = phoneNumber.isNotBlank(),
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Icon(Icons.Default.Call, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Call")
+            }
+        }
+    }
+}
+
+@Composable
+private fun NearbyPanelMessage(icon: ImageVector, text: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.72f))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(modifier = Modifier.width(10.dp))
+        Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun RiskTextBadge(label: String, score: Float) {
+    val color = riskColor(score)
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(color.copy(alpha = 0.14f))
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    ) {
+        Text(label, color = color, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+    }
+    Spacer(modifier = Modifier.width(8.dp))
 }
 
 @Composable
@@ -655,70 +732,181 @@ fun RiskBadge(riskLevel: RiskLevel) {
     }
 }
 
-fun updateLeafletContent(
+private fun loadNearbySafetyForMap(
+    context: Context,
+    location: LatLng
+): NearbyMapLoadResult {
+    val repository = RiskZoneRepository(context)
+    val items = mutableListOf<MapNearbySafetyItem>()
+
+    repository.getSafetyPlacesNear(location, NEARBY_SAFETY_RADIUS_KM)
+        .take(MAX_NEARBY_ITEMS)
+        .forEach { place ->
+            val distance = RiskZoneRepository.distanceKm(location, place.location)
+            val riskScore = repository.computeRiskAtLocation(place.location)
+            items.add(
+                MapNearbySafetyItem(
+                    id = "place_${place.id}",
+                    name = place.name,
+                    category = when (place.type) {
+                        SafetyPlaceType.POLICE -> NearbyMapCategory.POLICE
+                        SafetyPlaceType.HOSPITAL -> NearbyMapCategory.HOSPITAL
+                    },
+                    location = place.location,
+                    distanceKm = distance,
+                    riskScore = riskScore,
+                    riskLabel = riskLabelForScore(riskScore),
+                    subtitle = place.address.ifBlank { place.city },
+                    phoneNumber = place.phoneNumber
+                )
+            )
+        }
+
+    return NearbyMapLoadResult(
+        items = items.sortedBy { it.distanceKm },
+        crimeZones = repository.getCrimeZonesForMap()
+    )
+}
+
+private fun buildNearbySafetyDetail(
+    context: Context,
+    origin: LatLng,
+    item: MapNearbySafetyItem,
+    disasters: List<DisasterAlert>
+): MapSelectedSafetyDetail {
+    val repository = RiskZoneRepository(context)
+    val routeOptions = repository.suggestSafeWaypoints(origin, item.location)
+    val safestRoute = routeOptions.firstOrNull { it.isSafest }
+        ?: routeOptions.minByOrNull { it.totalRiskScore }
+    val distanceKm = safestRoute?.distanceKm?.toDouble() ?: item.distanceKm
+    val routeRisk = safestRoute?.totalRiskScore ?: item.riskScore
+    val syntheticRoute = SafeRoute(
+        id = "nearby_${item.id}",
+        polyline = "",
+        distance = (distanceKm * 1000).toLong(),
+        duration = (distanceKm * 3 * 60).toLong(),
+        riskScore = routeRisk,
+        riskLevel = riskLevelForScore(routeRisk),
+        summary = "Route to ${item.name}",
+        isRecommended = true
+    )
+    return MapSelectedSafetyDetail(
+        item = item,
+        safestRoute = safestRoute,
+        recommendation = VehicleRecommender().recommendVehicle(syntheticRoute, disasters)
+    )
+}
+
+private fun nearbyIconAndColor(category: NearbyMapCategory): Pair<ImageVector, Color> {
+    return when (category) {
+        NearbyMapCategory.POLICE -> Icons.Default.LocalPolice to Color(0xFF1565C0)
+        NearbyMapCategory.HOSPITAL -> Icons.Default.LocalHospital to Color(0xFFD32F2F)
+        NearbyMapCategory.ALL -> Icons.Default.Place to Color(0xFF607D8B)
+    }
+}
+
+private data class NearbyMarkerStyle(
+    val label: String,
+    val color: String
+)
+
+private fun nearbyMarkerStyle(category: NearbyMapCategory, selected: Boolean): NearbyMarkerStyle {
+    if (selected) return NearbyMarkerStyle("!", "#111827")
+    return when (category) {
+        NearbyMapCategory.POLICE -> NearbyMarkerStyle("P", "#1565C0")
+        NearbyMapCategory.HOSPITAL -> NearbyMarkerStyle("H", "#D32F2F")
+        NearbyMapCategory.ALL -> NearbyMarkerStyle("N", "#607D8B")
+    }
+}
+
+private fun riskLabelForScore(score: Float): String {
+    return when {
+        score >= 0.7f -> "HIGH"
+        score >= 0.4f -> "MEDIUM"
+        else -> "LOW"
+    }
+}
+
+private fun riskLevelForScore(score: Float): RiskLevel {
+    return when {
+        score >= 0.7f -> RiskLevel.HIGH
+        score >= 0.4f -> RiskLevel.MEDIUM
+        else -> RiskLevel.LOW
+    }
+}
+
+private fun riskColor(score: Float): Color {
+    return when {
+        score >= 0.7f -> Color(0xFFF44336)
+        score >= 0.4f -> Color(0xFFFF9800)
+        else -> Color(0xFF4CAF50)
+    }
+}
+
+private fun openPhoneDialer(context: Context, phoneNumber: String) {
+    if (phoneNumber.isBlank()) return
+    val intent = Intent(Intent.ACTION_DIAL).apply {
+        data = Uri.fromParts("tel", phoneNumber, null)
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+    context.startActivity(intent)
+}
+
+private fun openMapNavigation(context: Context, destination: LatLng) {
+    val mapsIntent = Intent(
+        Intent.ACTION_VIEW,
+        Uri.parse("google.navigation:q=${destination.latitude},${destination.longitude}")
+    ).apply {
+        setPackage("com.google.android.apps.maps")
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+    }
+
+    try {
+        context.startActivity(mapsIntent)
+    } catch (e: Exception) {
+        val fallbackIntent = Intent(
+            Intent.ACTION_VIEW,
+            Uri.parse("https://www.google.com/maps/dir/?api=1&destination=${destination.latitude},${destination.longitude}")
+        ).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(fallbackIntent)
+    }
+}
+
+private fun updateLeafletContent(
     controller: LeafletMapController,
-    crimeHotspots: List<HotspotEntity>,
-    disasters: List<DisasterAlert>,
     currentLocation: com.google.android.gms.maps.model.LatLng?,
-    routes: List<SafeRoute>,
-    selectedRoute: SafeRoute?
+    nearbyItems: List<MapNearbySafetyItem> = emptyList(),
+    selectedNearbyItem: MapNearbySafetyItem? = null
 ) {
     val markers = mutableListOf<MarkerData>()
-    val circles = mutableListOf<CircleData>()
-    val polylines = mutableListOf<PolylineData>()
 
-    // Routes (drawn first so they appear under markers)
-    routes.forEach { route ->
-        val points = PolyUtil.decode(route.polyline)
-        val isSelected = route == selectedRoute
-        val color = when {
-            isSelected -> "#2196F3"
-            route.riskLevel == RiskLevel.LOW -> "#4CAF50"
-            route.riskLevel == RiskLevel.MEDIUM -> "#FF9800"
-            else -> "#F44336"
-        }
-        polylines.add(PolylineData(
-            points = points,
-            color = color,
-            weight = if (isSelected) 6 else 4
-        ))
+    val nearbyForMap = if (selectedNearbyItem != null && nearbyItems.none { it.id == selectedNearbyItem.id }) {
+        nearbyItems + selectedNearbyItem
+    } else {
+        nearbyItems
     }
-
-    // Crime hotspot markers
-    crimeHotspots.forEach { hotspot ->
-        markers.add(MarkerData(hotspot.lat, hotspot.lng, "Crime Hotspot", color = "#F44336"))
-    }
-
-    // Disaster zones
-    disasters.forEach { disaster ->
-        val color = when (disaster.severity) {
-            Severity.LOW -> "#FFEB3B"
-            Severity.MODERATE -> "#FF9800"
-            Severity.HIGH, Severity.CRITICAL -> "#F44336"
-        }
-        circles.add(CircleData(
-            lat = disaster.location.latitude,
-            lng = disaster.location.longitude,
-            radius = disaster.radius * 1000.0,
-            fillColor = color,
-            strokeColor = color
-        ))
-        markers.add(MarkerData(
-            disaster.location.latitude,
-            disaster.location.longitude,
-            "${disaster.type.name} Alert",
-            snippet = disaster.description,
-            color = "#FF9800"
-        ))
+    nearbyForMap.forEach { item ->
+        val style = nearbyMarkerStyle(item.category, item.id == selectedNearbyItem?.id)
+        markers.add(
+            MarkerData(
+                item.location.latitude,
+                item.location.longitude,
+                item.name,
+                "${"%.1f".format(item.distanceKm)} km | Risk ${item.riskLabel}",
+                style.color,
+                style.label,
+                style.color
+            )
+        )
     }
 
     controller.batchUpdate(MapUpdateData(
         clear = true,
         currentLocation = currentLocation?.let { it.latitude to it.longitude },
         markers = markers,
-        circles = circles,
-        polylines = polylines,
-        fitToLayers = routes.isEmpty() && markers.isNotEmpty()
+        fitToLayers = selectedNearbyItem == null && markers.isNotEmpty()
     ))
 }
 
@@ -853,5 +1041,5 @@ fun createMockRoutesForTest(
     )
 }
 
-private const val MAX_LAYER_MARKERS = 80
-private const val MAX_SAFE_ZONE_MARKERS = 24
+private const val NEARBY_SAFETY_RADIUS_KM = 5.0
+private const val MAX_NEARBY_ITEMS = 24
