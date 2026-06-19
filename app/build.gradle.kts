@@ -95,6 +95,9 @@ dependencies {
     
     // DataStore
     implementation("androidx.datastore:datastore-preferences:1.0.0")
+
+    // Encrypted preferences for safety PINs
+    implementation("androidx.security:security-crypto:1.0.0")
     
     // WorkManager
     implementation("androidx.work:work-runtime-ktx:2.9.0")

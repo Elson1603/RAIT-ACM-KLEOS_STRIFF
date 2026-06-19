@@ -72,6 +72,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ui.screens.SosPinVerificationActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@style/Theme.SafePulse" />
+
         <!-- Safety Foreground Service -->
         <service
             android:name=".service.SafetyForegroundService"

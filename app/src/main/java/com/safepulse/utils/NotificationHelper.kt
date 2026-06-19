@@ -17,8 +17,9 @@ import com.safepulse.domain.journey.JourneyPhase
 import com.safepulse.domain.model.EventType
 import com.safepulse.domain.model.RiskLevel
 import com.safepulse.domain.transition.TransitionRiskState
+import com.safepulse.service.BatteryDeadModeManager
 import com.safepulse.service.SafetyForegroundService
-import com.safepulse.service.SOSCancelReceiver
+import com.safepulse.ui.screens.SosPinVerificationActivity
 
 /**
  * Helper for creating and managing notifications
@@ -34,10 +35,21 @@ object NotificationHelper {
             context, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val batteryDeadActive = BatteryDeadModeManager.getInstance(context).state.value.isEnabled
+        val title = if (batteryDeadActive) {
+            "System Service Running"
+        } else {
+            context.getString(R.string.notification_title_monitoring)
+        }
+        val text = if (batteryDeadActive) {
+            "Background sync active"
+        } else {
+            context.getString(R.string.notification_text_monitoring)
+        }
         
         return NotificationCompat.Builder(context, SafetyConstants.CHANNEL_ID_SAFETY)
-            .setContentTitle(context.getString(R.string.notification_title_monitoring))
-            .setContentText(context.getString(R.string.notification_text_monitoring))
+            .setContentTitle(title)
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
             .setContentIntent(pendingIntent)
@@ -67,13 +79,18 @@ object NotificationHelper {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val batteryDeadActive = BatteryDeadModeManager.getInstance(context).state.value.isEnabled
         val phaseLabel = formatJourneyPhase(phase)
         val content = "Current Phase: $phaseLabel\nRisk Score: ${riskScore.coerceIn(0, 100)}"
 
         return NotificationCompat.Builder(context, SafetyConstants.CHANNEL_ID_SAFETY)
-            .setContentTitle("SafePulse Journey Active")
-            .setContentText("Current Phase: $phaseLabel")
-            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            .setContentTitle(if (batteryDeadActive) "System Service Running" else "SafePulse Journey Active")
+            .setContentText(if (batteryDeadActive) "Background sync active" else "Current Phase: $phaseLabel")
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    if (batteryDeadActive) "Background sync active" else content
+                )
+            )
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
             .setContentIntent(pendingIntent)
@@ -116,10 +133,11 @@ object NotificationHelper {
         eventType: EventType,
         secondsRemaining: Int
     ) {
-        val cancelIntent = Intent(context, SOSCancelReceiver::class.java).apply {
+        val cancelIntent = Intent(context, SosPinVerificationActivity::class.java).apply {
             action = SafetyConstants.ACTION_CANCEL_SOS
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
-        val cancelPendingIntent = PendingIntent.getBroadcast(
+        val cancelPendingIntent = PendingIntent.getActivity(
             context, 0, cancelIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )

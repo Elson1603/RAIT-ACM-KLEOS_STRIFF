@@ -26,6 +26,7 @@ import com.safepulse.data.repository.EventLogRepository
 import com.safepulse.data.repository.HotspotRepository
 import com.safepulse.data.repository.RiskZoneRepository
 import com.safepulse.data.repository.UnsafeZoneRepository
+import com.safepulse.data.security.PinVerificationResult
 import com.safepulse.domain.engine.SafetyEngine
 import com.safepulse.domain.model.*
 import com.safepulse.ml.StubVoiceTriggerModule
@@ -90,6 +91,9 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             SafetyConstants.ACTION_STOP_SERVICE -> {
+                if (SafetyFeatureManager.getInstance(applicationContext).state.value.duressModeActive) {
+                    return START_STICKY
+                }
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -330,7 +334,7 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
     
     private fun handleSafetyStateChange(state: SafetyState) {
         // Update location tracking mode
-        if (state.mode == SafetyMode.HEIGHTENED) {
+        if (safetyFeatureManager.state.value.duressModeActive || state.mode == SafetyMode.HEIGHTENED) {
             locationTracker.updateMode(SafetyMode.HEIGHTENED)
             updateSensorDelay(SafetyConstants.SENSOR_DELAY_HEIGHTENED_US)
         } else {
@@ -350,6 +354,11 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
     
     private fun handleEmergencyEvent(event: EmergencyEvent) {
         if (isEmergencyCountdownActive) return
+
+        if (BatteryDeadModeManager.getInstance(applicationContext).state.value.isEnabled) {
+            executeEmergencyResponse(event.copy(requiresConfirmation = false, silent = true))
+            return
+        }
         
         if (event.requiresConfirmation) {
             startEmergencyCountdown(event)
@@ -390,6 +399,22 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
         safetyFeatureManager.stopLiveTracking("Emergency countdown cancelled")
         safetyEngine.clearEmergency()
     }
+
+    fun cancelEmergencyWithPin(pin: String): PinVerificationResult {
+        val result = safetyFeatureManager.handleCancelPin(
+            pin = pin,
+            riskScore = safetyEngine.safetyState.value.riskScore
+        )
+        if (result == PinVerificationResult.NORMAL_CANCELLED ||
+            result == PinVerificationResult.DISABLED_CANCELLED
+        ) {
+            countdownJob?.cancel()
+            isEmergencyCountdownActive = false
+            NotificationHelper.cancelEmergencyNotification(this)
+            safetyEngine.clearEmergency()
+        }
+        return result
+    }
     
     /**
      * Trigger manual SOS from UI
@@ -407,6 +432,8 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
     
     private fun executeEmergencyResponse(event: EmergencyEvent) {
         serviceScope.launch {
+            val forceSilent = event.silent ||
+                BatteryDeadModeManager.getInstance(applicationContext).state.value.isEnabled
             // Get emergency contacts
             val contacts = contactRepository.getAllContactsList()
             val primaryContact = contactRepository.getPrimaryContact()
@@ -414,11 +441,12 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
 
             safetyFeatureManager.startLiveTracking(event.type.name, contacts)
             safetyFeatureManager.appendTimeline(
-                title = if (event.silent) "Silent SOS triggered" else "SOS triggered",
+                title = if (forceSilent) "Silent SOS triggered" else "SOS triggered",
                 detail = "Confidence ${(event.confidence * 100).toInt()}%",
                 location = event.location?.let { LatLng(it.latitude, it.longitude) },
                 riskLevel = safetyEngine.safetyState.value.riskLevel,
-                safetyMode = safetyEngine.safetyState.value.mode
+                safetyMode = safetyEngine.safetyState.value.mode,
+                eventType = "SOS_TRIGGERED"
             )
             
             Log.i("SafetyService", if (event.silent) "🔇 Silent Alert - SMS only" else "🚨 Full Alert - SMS + Call")
@@ -431,7 +459,7 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
             
             // Only initiate call if NOT silent mode
             var callStarted = false
-            if (!event.silent) {
+            if (!forceSilent) {
                 Log.i("SafetyService", "📞 Initiating emergency call...")
                 callStarted = emergencyManager.initiateEmergencyCall(primaryContact)
                 Log.i("SafetyService", "📞 Emergency call result: $callStarted")
@@ -449,7 +477,7 @@ class SafetyForegroundService : LifecycleService(), SensorEventListener {
                 wasSOSSent = smsSent
             )
             journeyTrackingService.onEmergencyTriggered(
-                if (event.silent) "Silent SOS triggered" else "SOS triggered"
+                if (forceSilent) "Silent SOS triggered" else "SOS triggered"
             )
 
             safetyFeatureManager.appendTimeline(

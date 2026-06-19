@@ -35,6 +35,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.lifecycleScope
@@ -43,6 +44,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.safepulse.data.prefs.UserPreferences
+import com.safepulse.service.BatteryDeadModeManager
 import com.safepulse.ui.journey.JourneyTimelineScreen
 import com.safepulse.ui.journey.CompanionJourneyScreen
 import com.safepulse.ui.onboarding.OnboardingOverlayScreen
@@ -153,10 +155,13 @@ fun OnboardingFlow(onComplete: () -> Unit) {
 
 @Composable
 fun MainNavigation() {
+    val context = LocalContext.current
     val navController = rememberNavController()
     val homeViewModel: HomeViewModel = viewModel()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    val batteryDeadModeManager = remember(context) { BatteryDeadModeManager.getInstance(context) }
+    val batteryDeadState by batteryDeadModeManager.state.collectAsState()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: "home"
 
@@ -258,6 +263,12 @@ fun MainNavigation() {
                         onBack = { navController.popBackStack() }
                     )
                 }
+            }
+
+            if (batteryDeadState.isEnabled) {
+                BatteryDeadModeScreen(
+                    onExitPinEntered = { batteryDeadModeManager.verifyExitPin(it) }
+                )
             }
         }
     }

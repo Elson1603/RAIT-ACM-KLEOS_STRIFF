@@ -14,6 +14,9 @@ import com.google.android.gms.maps.model.LatLng
 import com.google.gson.Gson
 import com.safepulse.SafePulseApplication
 import com.safepulse.data.db.entity.EmergencyContactEntity
+import com.safepulse.data.repository.EmergencyContactRepository
+import com.safepulse.data.security.PinVerificationResult
+import com.safepulse.data.security.SafetyPinRepository
 import com.safepulse.domain.model.RiskLevel
 import com.safepulse.domain.model.SafetyMode
 import com.safepulse.ui.map.TileCacheManager
@@ -42,7 +45,9 @@ data class SafetyTimelineEntry(
     val lng: Double? = null,
     val batteryPercent: Int? = null,
     val riskLevel: String? = null,
-    val safetyMode: String? = null
+    val safetyMode: String? = null,
+    val eventType: String? = null,
+    val hidden: Boolean = false
 )
 
 data class ContactAcknowledgement(
@@ -68,6 +73,13 @@ data class SafetyCheckInState(
     val label: String = ""
 )
 
+data class DuressState(
+    val isDuressActive: Boolean = false,
+    val activatedAt: Long = 0L,
+    val lastLocation: LatLng? = null,
+    val escalationLevel: Int = 0
+)
+
 data class SafetyFeatureState(
     val liveTrackingActive: Boolean = false,
     val liveTrackingSessionId: String = "",
@@ -79,6 +91,7 @@ data class SafetyFeatureState(
     val offlineCacheSummary: String = "Not prepared",
     val duressPinEnabled: Boolean = true,
     val duressModeActive: Boolean = false,
+    val duressState: DuressState = DuressState(),
     val trustedJourney: TrustedJourneyState = TrustedJourneyState(),
     val safetyCheckIn: SafetyCheckInState = SafetyCheckInState(),
     val nearbyHelperNetworkEnabled: Boolean = false,
@@ -96,8 +109,6 @@ class SafetyFeatureManager private constructor(private val context: Context) {
         private const val TAG = "SafetyFeatures"
         private const val PREFS = "advanced_safety_features"
         private const val KEY_OFFLINE_MODE = "offline_mode"
-        private const val KEY_DURESS_PIN = "duress_pin"
-        private const val KEY_NORMAL_CANCEL_PIN = "normal_cancel_pin"
         private const val KEY_CHECK_IN_ACTIVE = "check_in_active"
         private const val KEY_CHECK_IN_DUE_AT = "check_in_due_at"
         private const val KEY_CHECK_IN_STARTED_AT = "check_in_started_at"
@@ -121,19 +132,21 @@ class SafetyFeatureManager private constructor(private val context: Context) {
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val safetyPinRepository = SafetyPinRepository.getInstance(context)
     private val gson = Gson()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val timelineFile = File(context.filesDir, "emergency_timeline.jsonl")
     private var trackingJob: Job? = null
     private var journeyJob: Job? = null
+    private var duressEscalationJob: Job? = null
     private var locationProvider: (() -> LatLng?)? = null
 
     private val _state = MutableStateFlow(
         SafetyFeatureState(
             offlineSafetyEnabled = prefs.getBoolean(KEY_OFFLINE_MODE, false),
             offlineCacheSummary = buildOfflineCacheSummary(),
-            timeline = readTimeline().takeLast(25),
-            duressPinEnabled = true,
+            timeline = readTimeline(includeHidden = false).takeLast(25),
+            duressPinEnabled = safetyPinRepository.config.value.isEnabled,
             safetyCheckIn = readSafetyCheckInState(),
             sosMessageTemplate = getSosMessageTemplate(),
             fakeCallerName = getFakeCallerName()
@@ -143,7 +156,11 @@ class SafetyFeatureManager private constructor(private val context: Context) {
 
     init {
         createNotificationChannel()
-        ensureDefaultPins()
+        scope.launch {
+            safetyPinRepository.config.collect { config ->
+                _state.value = _state.value.copy(duressPinEnabled = config.isEnabled)
+            }
+        }
     }
 
     fun setLocationProvider(provider: () -> LatLng?) {
@@ -169,7 +186,12 @@ class SafetyFeatureManager private constructor(private val context: Context) {
             duressModeActive = false
         )
 
-        appendTimeline("Live SOS tracking started", "Trigger: $trigger", locationProvider?.invoke())
+        appendTimeline(
+            "Live SOS tracking started",
+            "Trigger: $trigger",
+            locationProvider?.invoke(),
+            eventType = "SOS_TRIGGERED"
+        )
         showLiveTrackingNotification()
 
         trackingJob?.cancel()
@@ -180,12 +202,22 @@ class SafetyFeatureManager private constructor(private val context: Context) {
                     _state.value = _state.value.copy(lastTrackingLocation = location)
                     appendTimeline("Tracking update", "Location refreshed", location)
                 }
-                delay(5_000)
+                delay(if (_state.value.duressModeActive) 2_000 else 5_000)
             }
         }
     }
 
     fun stopLiveTracking(reason: String) {
+        if (_state.value.duressModeActive) {
+            appendTimeline(
+                "Live tracking kept active",
+                "Stop request ignored because silent distress mode is active",
+                locationProvider?.invoke(),
+                eventType = "DURESS_MODE_ACTIVE",
+                hidden = true
+            )
+            return
+        }
         trackingJob?.cancel()
         trackingJob = null
         appendTimeline("Live SOS tracking stopped", reason, locationProvider?.invoke())
@@ -262,41 +294,147 @@ class SafetyFeatureManager private constructor(private val context: Context) {
         appendTimeline("Fake caller updated", cleanName, locationProvider?.invoke())
     }
 
-    fun setDuressPin(pin: String) {
-        if (pin.length >= 4) {
-            prefs.edit().putString(KEY_DURESS_PIN, pin).apply()
+    fun setSafetyPinEnabled(enabled: Boolean) {
+        safetyPinRepository.setEnabled(enabled)
+        appendTimeline(
+            if (enabled) "Silent Safety PIN enabled" else "Silent Safety PIN disabled",
+            "PIN status changed",
+            locationProvider?.invoke()
+        )
+    }
+
+    fun setSafetyPins(normalPin: String, duressPin: String, enabled: Boolean = _state.value.duressPinEnabled): Boolean {
+        val saved = safetyPinRepository.setPins(normalPin, duressPin, enabled)
+        if (saved) {
+            appendTimeline("Silent Safety PIN updated", "Normal and duress PIN hashes changed", locationProvider?.invoke())
+        }
+        return saved
+    }
+
+    fun handleCancelPin(pin: String, riskScore: Float = 0f): PinVerificationResult {
+        return when (val result = safetyPinRepository.verifyPin(pin)) {
+            PinVerificationResult.NORMAL_CANCELLED,
+            PinVerificationResult.DISABLED_CANCELLED -> {
+                appendTimeline(
+                    title = "SOS cancelled",
+                    detail = if (result == PinVerificationResult.DISABLED_CANCELLED) {
+                        "Silent Safety PIN disabled"
+                    } else {
+                        "Normal cancel PIN accepted"
+                    },
+                    location = locationProvider?.invoke(),
+                    eventType = "SOS_CANCELLED"
+                )
+                duressEscalationJob?.cancel()
+                _state.value = _state.value.copy(
+                    duressModeActive = false,
+                    duressState = DuressState()
+                )
+                stopLiveTracking("Cancelled with normal PIN")
+                result
+            }
+            PinVerificationResult.DURESS_ACTIVATED -> {
+                activateDuressMode(riskScore)
+                result
+            }
+            PinVerificationResult.INVALID -> result
         }
     }
 
-    fun setSafetyPins(normalPin: String, duressPin: String): Boolean {
-        val normal = normalPin.trim()
-        val duress = duressPin.trim()
-        if (normal.length < 4 || duress.length < 4 || normal == duress) return false
+    private fun activateDuressMode(riskScore: Float) {
+        val now = System.currentTimeMillis()
+        val location = locationProvider?.invoke()
+        val duressState = DuressState(
+            isDuressActive = true,
+            activatedAt = now,
+            lastLocation = location,
+            escalationLevel = 0
+        )
 
-        prefs.edit()
-            .putString(KEY_NORMAL_CANCEL_PIN, normal.take(8))
-            .putString(KEY_DURESS_PIN, duress.take(8))
-            .apply()
-        appendTimeline("Safety PINs updated", "Normal and duress PINs changed", locationProvider?.invoke())
-        return true
+        _state.value = _state.value.copy(
+            duressModeActive = true,
+            duressState = duressState,
+            liveTrackingActive = true,
+            lastTrackingLocation = location ?: _state.value.lastTrackingLocation
+        )
+
+        appendTimeline(
+            title = "Duress PIN used",
+            detail = "Silent distress mode activated",
+            location = location,
+            eventType = "DURESS_PIN_USED",
+            hidden = true
+        )
+        appendTimeline(
+            title = "Duress mode active",
+            detail = "Protection continues secretly in background",
+            location = location,
+            eventType = "DURESS_MODE_ACTIVE",
+            hidden = true
+        )
+        showLiveTrackingNotification()
+        silentlyNotifyTrustedContacts(level = 0, riskScore = riskScore)
+        startDuressEscalation(riskScore)
     }
 
-    fun handleCancelPin(pin: String): Boolean {
-        val duressPin = prefs.getString(KEY_DURESS_PIN, "0000")
-        val normalPin = prefs.getString(KEY_NORMAL_CANCEL_PIN, "1234")
+    private fun startDuressEscalation(riskScore: Float) {
+        duressEscalationJob?.cancel()
+        duressEscalationJob = scope.launch {
+            listOf(
+                1 to 5 * 60_000L,
+                2 to 5 * 60_000L,
+                3 to 5 * 60_000L
+            ).forEach { (level, delayMillis) ->
+                delay(delayMillis)
+                if (!_state.value.duressModeActive) return@launch
+                _state.value = _state.value.copy(
+                    duressState = _state.value.duressState.copy(
+                        lastLocation = locationProvider?.invoke() ?: _state.value.duressState.lastLocation,
+                        escalationLevel = level
+                    )
+                )
+                silentlyNotifyTrustedContacts(level = level, riskScore = riskScore)
+                appendTimeline(
+                    title = "Duress escalation level $level",
+                    detail = "Silent protection escalation executed",
+                    location = locationProvider?.invoke(),
+                    eventType = "DURESS_MODE_ACTIVE",
+                    hidden = true
+                )
 
-        return when (pin) {
-            duressPin -> {
-                _state.value = _state.value.copy(duressModeActive = true)
-                appendTimeline("Duress PIN entered", "SOS stayed active silently", locationProvider?.invoke())
-                false
+                if (level == 3) {
+                    SafetyForegroundService.getInstance()?.triggerSilentSOS()
+                }
             }
-            normalPin -> {
-                appendTimeline("SOS cancelled with PIN", "Normal cancel PIN accepted", locationProvider?.invoke())
-                stopLiveTracking("Cancelled with normal PIN")
-                true
+        }
+    }
+
+    private fun silentlyNotifyTrustedContacts(level: Int, riskScore: Float) {
+        scope.launch {
+            val app = context as? SafePulseApplication ?: return@launch
+            val contacts = EmergencyContactRepository(app.database.emergencyContactDao()).getAllContactsList()
+            if (contacts.isEmpty()) return@launch
+
+            val location = locationProvider?.invoke() ?: _state.value.duressState.lastLocation
+            val timestamp = SimpleDateFormat("dd MMM yyyy, HH:mm:ss", Locale.getDefault()).format(Date())
+            val locationText = location?.let {
+                "${it.latitude}, ${it.longitude}\nMap: https://maps.google.com/?q=${it.latitude},${it.longitude}"
+            } ?: "Location is being acquired"
+            val levelText = when (level) {
+                1 -> "Level 1 escalation: silent distress still active."
+                2 -> "Level 2 escalation: updated location shared."
+                3 -> "Level 3 escalation: full emergency workflow triggered."
+                else -> "Silent distress mode activated."
             }
-            else -> false
+            val message = """
+                Silent distress mode activated.
+                $levelText
+                Time: $timestamp
+                Location: $locationText
+                Risk score: ${(riskScore * 100).toInt()}
+            """.trimIndent()
+
+            EmergencyManager(context).sendJourneyStatusMessages(contacts, message)
         }
     }
 
@@ -404,7 +542,7 @@ class SafetyFeatureManager private constructor(private val context: Context) {
     }
 
     fun exportTimelineText(): String {
-        val entries = _state.value.timeline.ifEmpty { readTimeline().takeLast(25) }
+        val entries = _state.value.timeline.ifEmpty { readTimeline(includeHidden = false).takeLast(25) }
         if (entries.isEmpty()) {
             return "SafePulse Emergency Timeline\n\nNo emergency timeline entries recorded yet."
         }
@@ -436,7 +574,9 @@ class SafetyFeatureManager private constructor(private val context: Context) {
         detail: String,
         location: LatLng?,
         riskLevel: RiskLevel? = null,
-        safetyMode: SafetyMode? = null
+        safetyMode: SafetyMode? = null,
+        eventType: String? = null,
+        hidden: Boolean = false
     ) {
         val entry = SafetyTimelineEntry(
             timestamp = System.currentTimeMillis(),
@@ -446,7 +586,9 @@ class SafetyFeatureManager private constructor(private val context: Context) {
             lng = location?.longitude,
             batteryPercent = getBatteryPercent(),
             riskLevel = riskLevel?.name,
-            safetyMode = safetyMode?.name
+            safetyMode = safetyMode?.name,
+            eventType = eventType,
+            hidden = hidden
         )
 
         runCatching {
@@ -455,17 +597,20 @@ class SafetyFeatureManager private constructor(private val context: Context) {
             Log.w(TAG, "Failed to persist timeline: ${it.message}")
         }
 
-        _state.value = _state.value.copy(
-            timeline = (_state.value.timeline + entry).takeLast(25)
-        )
+        if (!hidden) {
+            _state.value = _state.value.copy(
+                timeline = (_state.value.timeline + entry).takeLast(25)
+            )
+        }
     }
 
-    private fun readTimeline(): List<SafetyTimelineEntry> {
+    private fun readTimeline(includeHidden: Boolean): List<SafetyTimelineEntry> {
         if (!timelineFile.exists()) return emptyList()
         return runCatching {
             timelineFile.readLines()
                 .filter { it.isNotBlank() }
                 .map { gson.fromJson(it, SafetyTimelineEntry::class.java) }
+                .filter { includeHidden || !it.hidden }
         }.getOrElse { emptyList() }
     }
 
@@ -498,15 +643,6 @@ class SafetyFeatureManager private constructor(private val context: Context) {
     private fun getBatteryPercent(): Int? {
         val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
         return batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-    }
-
-    private fun ensureDefaultPins() {
-        if (!prefs.contains(KEY_DURESS_PIN)) {
-            prefs.edit()
-                .putString(KEY_DURESS_PIN, "0000")
-                .putString(KEY_NORMAL_CANCEL_PIN, "1234")
-                .apply()
-        }
     }
 
     private fun createNotificationChannel() {

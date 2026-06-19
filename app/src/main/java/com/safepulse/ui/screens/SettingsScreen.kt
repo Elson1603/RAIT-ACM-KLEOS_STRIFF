@@ -132,8 +132,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         safetyFeatureManager.setFakeCallerName(name)
     }
 
-    fun setSafetyPins(normalPin: String, duressPin: String): Boolean {
-        return safetyFeatureManager.setSafetyPins(normalPin, duressPin)
+    fun setSafetyPinEnabled(enabled: Boolean) {
+        safetyFeatureManager.setSafetyPinEnabled(enabled)
+    }
+
+    fun setSafetyPins(normalPin: String, duressPin: String, enabled: Boolean): Boolean {
+        return safetyFeatureManager.setSafetyPins(normalPin, duressPin, enabled)
     }
     
     fun addContact(name: String, phone: String, isPrimary: Boolean) {
@@ -316,8 +320,8 @@ fun SettingsScreen(
 
                         SafetyActionRow(
                             icon = Icons.Default.Pin,
-                            title = "Cancel and duress PINs",
-                            subtitle = "Update the normal cancel PIN and silent duress PIN",
+                            title = "Silent Safety PIN",
+                            subtitle = if (state.safetyFeatures.duressPinEnabled) "Status: Enabled" else "Status: Disabled",
                             iconColor = WarningYellow,
                             onClick = { showPinDialog = true }
                         )
@@ -674,9 +678,11 @@ fun SettingsScreen(
 
     if (showPinDialog) {
         PinSettingsDialog(
+            enabled = state.safetyFeatures.duressPinEnabled,
             onDismiss = { showPinDialog = false },
-            onSave = { normalPin, duressPin ->
-                viewModel.setSafetyPins(normalPin, duressPin)
+            onEnabledChange = { viewModel.setSafetyPinEnabled(it) },
+            onSave = { normalPin, duressPin, enabled ->
+                viewModel.setSafetyPins(normalPin, duressPin, enabled)
             }
         )
     }
@@ -817,18 +823,41 @@ private fun EditableSafetyTextDialog(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PinSettingsDialog(
+    enabled: Boolean,
     onDismiss: () -> Unit,
-    onSave: (normalPin: String, duressPin: String) -> Boolean
+    onEnabledChange: (Boolean) -> Unit,
+    onSave: (normalPin: String, duressPin: String, enabled: Boolean) -> Boolean
 ) {
     var normalPin by remember { mutableStateOf("") }
     var duressPin by remember { mutableStateOf("") }
+    var isEnabled by remember { mutableStateOf(enabled) }
     var error by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Update safety PINs") },
+        title = { Text("Silent Safety PIN") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Enable Silent Safety PIN", fontWeight = FontWeight.Medium)
+                        Text(
+                            if (isEnabled) "Status: Enabled" else "Status: Disabled",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                        )
+                    }
+                    Switch(
+                        checked = isEnabled,
+                        onCheckedChange = {
+                            isEnabled = it
+                            onEnabledChange(it)
+                        }
+                    )
+                }
                 Text(
                     "Use different PINs. The duress PIN looks like cancel, but keeps SOS active silently.",
                     style = MaterialTheme.typography.bodySmall,
@@ -837,7 +866,7 @@ private fun PinSettingsDialog(
                 OutlinedTextField(
                     value = normalPin,
                     onValueChange = {
-                        normalPin = it.filter(Char::isDigit).take(8)
+                        normalPin = it.filter(Char::isDigit).take(6)
                         error = null
                     },
                     label = { Text("Normal cancel PIN") },
@@ -848,7 +877,7 @@ private fun PinSettingsDialog(
                 OutlinedTextField(
                     value = duressPin,
                     onValueChange = {
-                        duressPin = it.filter(Char::isDigit).take(8)
+                        duressPin = it.filter(Char::isDigit).take(6)
                         error = null
                     },
                     label = { Text("Duress PIN") },
@@ -868,14 +897,14 @@ private fun PinSettingsDialog(
         confirmButton = {
             TextButton(
                 onClick = {
-                    val saved = onSave(normalPin, duressPin)
+                    val saved = onSave(normalPin, duressPin, isEnabled)
                     if (saved) {
                         onDismiss()
                     } else {
-                        error = "Enter two different PINs with at least 4 digits each"
+                        error = "Enter two different PINs with 4-6 digits each"
                     }
                 },
-                enabled = normalPin.length >= 4 && duressPin.length >= 4
+                enabled = normalPin.length in 4..6 && duressPin.length in 4..6 && normalPin != duressPin
             ) {
                 Text("Save")
             }

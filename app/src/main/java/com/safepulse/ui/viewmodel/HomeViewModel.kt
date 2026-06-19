@@ -12,6 +12,7 @@ import com.safepulse.data.repository.DisasterRepository
 import com.safepulse.data.repository.EmergencyContactRepository
 import com.safepulse.data.repository.EventLogRepository
 import com.safepulse.data.repository.HotspotRepository
+import com.safepulse.data.security.PinVerificationResult
 import com.safepulse.domain.model.RiskLevel
 import com.safepulse.domain.model.SafetyMode
 import com.safepulse.domain.journey.JourneySessionState
@@ -446,12 +447,14 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         safetyFeatureManager.runEmergencyDrill(_state.value.emergencyContacts)
     }
 
-    fun handleCancelPin(pin: String): Boolean {
-        val cancelled = safetyFeatureManager.handleCancelPin(pin)
-        if (cancelled) {
+    fun handleCancelPin(pin: String): PinVerificationResult {
+        val result = safetyFeatureManager.handleCancelPin(pin, _state.value.riskScore)
+        if (result == PinVerificationResult.NORMAL_CANCELLED ||
+            result == PinVerificationResult.DISABLED_CANCELLED
+        ) {
             SafetyForegroundService.getInstance()?.cancelEmergencyCountdown()
         }
-        return cancelled
+        return result
     }
 
     fun simulateContactHelpComing() {
