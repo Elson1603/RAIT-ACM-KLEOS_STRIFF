@@ -253,8 +253,7 @@ fun HomeScreen(
                 onComplete = { viewModel.completeSafeJourney() },
                 onCancel = { viewModel.cancelSafeJourney() },
                 onOpenTimeline = onNavigateToJourneyTimeline,
-                onOpenCompanionJourney = onNavigateToCompanionJourney,
-                onOpenSafeRoutes = onNavigateToSafeRoutes
+                onOpenCompanionJourney = onNavigateToCompanionJourney
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -863,8 +862,7 @@ private fun UnifiedJourneyCard(
     onComplete: () -> Unit,
     onCancel: () -> Unit,
     onOpenTimeline: () -> Unit,
-    onOpenCompanionJourney: () -> Unit,
-    onOpenSafeRoutes: () -> Unit
+    onOpenCompanionJourney: () -> Unit
 ) {
     var destination by remember { mutableStateOf("") }
     val session = journeyState.activeSession
@@ -933,16 +931,6 @@ private fun UnifiedJourneyCard(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Start Safe Journey")
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = onOpenSafeRoutes,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(Icons.Default.Map, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Plan with Safe Routes")
-                }
                 journeyState.latestSummary?.let { summary ->
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
@@ -1004,18 +992,6 @@ private fun UnifiedJourneyCard(
                     Icon(Icons.Default.People, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Open Companion Dashboard")
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                OutlinedButton(
-                    onClick = onOpenSafeRoutes,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(Icons.Default.Map, contentDescription = null)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Open Safe Routes")
                 }
 
                 Spacer(modifier = Modifier.height(8.dp))
