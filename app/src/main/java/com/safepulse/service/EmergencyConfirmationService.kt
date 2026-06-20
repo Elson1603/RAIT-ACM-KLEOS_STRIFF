@@ -130,6 +130,18 @@ class EmergencyConfirmationService(
             }
         }, 1_800L)
     }
+
+    /**
+     * Cancel the pending confirmation from a non-voice shortcut, such as
+     * triple volume-down during a shake SOS confirmation.
+     */
+    fun cancelFromHardwareShortcut(): Boolean {
+        if (!isConfirmationInProgress) return false
+
+        showToast("Emergency cancelled - monitoring still active")
+        cancelEmergency()
+        return true
+    }
     
     /**
      * Show toast notification
