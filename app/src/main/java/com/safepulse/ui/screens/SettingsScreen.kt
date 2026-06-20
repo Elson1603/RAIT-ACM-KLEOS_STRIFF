@@ -30,9 +30,13 @@ import com.safepulse.data.repository.EmergencyContactRepository
 import com.safepulse.data.repository.HotspotRepository
 import com.safepulse.data.repository.UnsafeZoneRepository
 import com.safepulse.domain.model.Gender
+import com.safepulse.domain.model.RiskLevel
+import com.safepulse.domain.model.SafetyMode
 import com.safepulse.ml.VoiceKeywordMatcher
+import com.safepulse.service.PhoneWatchSyncManager
 import com.safepulse.service.SafetyFeatureManager
 import com.safepulse.service.SafetyFeatureState
+import com.safepulse.service.WatchSyncUiState
 import com.safepulse.ui.theme.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,7 +53,8 @@ data class SettingsState(
     val contacts: List<EmergencyContactEntity> = emptyList(),
     val hotspots: List<HotspotEntity> = emptyList(),
     val unsafeZones: List<UnsafeZoneEntity> = emptyList(),
-    val safetyFeatures: SafetyFeatureState = SafetyFeatureState()
+    val safetyFeatures: SafetyFeatureState = SafetyFeatureState(),
+    val watchSync: WatchSyncUiState = WatchSyncUiState()
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -59,12 +64,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val hotspotRepository = HotspotRepository(app.database.hotspotDao())
     private val unsafeZoneRepository = UnsafeZoneRepository(app.database.unsafeZoneDao())
     private val safetyFeatureManager = SafetyFeatureManager.getInstance(application)
+    private val watchSyncManager = PhoneWatchSyncManager(application)
     
     private val _state = MutableStateFlow(SettingsState())
     val state: StateFlow<SettingsState> = _state.asStateFlow()
     
     init {
         loadData()
+        refreshWatchConnection()
     }
     
     private fun loadData() {
@@ -138,6 +145,51 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun setSafetyPins(normalPin: String, duressPin: String, enabled: Boolean): Boolean {
         return safetyFeatureManager.setSafetyPins(normalPin, duressPin, enabled)
+    }
+
+    fun refreshWatchConnection() {
+        viewModelScope.launch {
+            val previousSync = _state.value.watchSync
+            _state.value = _state.value.copy(
+                watchSync = previousSync.copy(isSyncing = true)
+            )
+            val status = watchSyncManager.checkConnection()
+            _state.value = _state.value.copy(
+                watchSync = status.copy(
+                    isSyncing = false,
+                    lastSyncMillis = previousSync.lastSyncMillis,
+                    contactsSynced = previousSync.contactsSynced,
+                    locationSynced = previousSync.locationSynced
+                )
+            )
+        }
+    }
+
+    fun syncWatchNow() {
+        viewModelScope.launch {
+            val currentState = _state.value
+            _state.value = currentState.copy(
+                watchSync = currentState.watchSync.copy(
+                    isSyncing = true,
+                    message = "Syncing watch..."
+                )
+            )
+
+            val syncStatus = watchSyncManager.syncNow(
+                riskLevel = RiskLevel.LOW,
+                riskScore = 0f,
+                safetyMode = SafetyMode.NORMAL,
+                serviceRunning = currentState.safetyFeatures.liveTrackingActive ||
+                    currentState.safetyFeatures.trustedJourney.active,
+                location = currentState.safetyFeatures.lastTrackingLocation,
+                contacts = currentState.contacts,
+                featureState = currentState.safetyFeatures
+            )
+
+            _state.value = _state.value.copy(
+                watchSync = syncStatus.copy(isSyncing = false)
+            )
+        }
     }
     
     fun addContact(name: String, phone: String, isPrimary: Boolean) {
@@ -327,6 +379,18 @@ fun SettingsScreen(
                         )
                     }
                 }
+            }
+
+            item {
+                SectionHeader("Watch Sync")
+            }
+
+            item {
+                WatchSyncCard(
+                    syncState = state.watchSync,
+                    onCheckWatch = { viewModel.refreshWatchConnection() },
+                    onSyncNow = { viewModel.syncWatchNow() }
+                )
             }
             
             // Emergency Contacts section

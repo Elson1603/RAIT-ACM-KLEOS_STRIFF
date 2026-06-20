@@ -13,13 +13,16 @@ import kotlin.math.*
 
 /**
  * Repository that loads risk data for the map.
- * Primary source: master_dataset.csv. Legacy JSON assets are used only as fallback.
+ * Primary source: live public feeds. master_dataset.csv and legacy JSON assets are fallback.
  */
 class RiskZoneRepository(private val context: Context) {
 
+    private val liveRiskFeedClient = LiveRiskFeedClient()
     private var crimeZonesCache: List<CrimeRiskZone>? = null
     private var disasterZonesCache: List<DisasterRiskZone>? = null
     private var safetyPlacesCache: List<SafetyPlace>? = null
+    private var liveRiskDataCache: CombinedRiskData? = null
+    private var liveRiskFetchedAtMillis: Long = 0L
 
     fun loadCrimeRiskZones(): List<CrimeRiskZone> {
         crimeZonesCache?.let { return it }
@@ -70,6 +73,29 @@ class RiskZoneRepository(private val context: Context) {
             crimeZones = loadCrimeRiskZones(),
             disasterZones = loadDisasterRiskZones()
         )
+    }
+
+    suspend fun loadLiveRiskDataPreferred(forceRefresh: Boolean = false): CombinedRiskData {
+        val now = System.currentTimeMillis()
+        if (!forceRefresh && now - liveRiskFetchedAtMillis < LIVE_RISK_TTL_MILLIS) {
+            liveRiskDataCache?.let { return it }
+        }
+
+        val liveResult = runCatching {
+            liveRiskFeedClient.fetchLiveRiskFeeds()
+        }.getOrNull()
+
+        val liveCrimeZones = liveResult?.crimeZones.orEmpty()
+        val merged = CombinedRiskData(
+            crimeZones = liveCrimeZones.ifEmpty { loadCrimeRiskZones() },
+            disasterZones = emptyList()
+        )
+
+        liveRiskDataCache = merged
+        liveRiskFetchedAtMillis = now
+        crimeZonesCache = merged.crimeZones
+        disasterZonesCache = merged.disasterZones
+        return merged
     }
 
     private fun loadMasterDatasetCrimeZones(): List<CrimeRiskZone>? {
@@ -194,10 +220,7 @@ class RiskZoneRepository(private val context: Context) {
      * Compute overall risk score at a given location considering all risk factors
      */
     fun computeRiskAtLocation(location: LatLng): Float {
-        val crimeRisk = computeCrimeRisk(location)
-        val disasterRisk = computeDisasterRisk(location)
-        // Weighted combination: 60% crime, 40% disaster
-        return (crimeRisk * 0.6f + disasterRisk * 0.4f).coerceIn(0f, 1f)
+        return computeCrimeRisk(location)
     }
 
     fun computeCrimeRisk(location: LatLng): Float {
@@ -248,7 +271,6 @@ class RiskZoneRepository(private val context: Context) {
     ): List<SafeRouteOption> {
         val directDistance = distanceKm(origin, destination).toFloat()
         val crimeZones = loadCrimeRiskZones()
-        val disasterZones = loadDisasterRiskZones()
 
         // Generate route options: direct, and 2 alternatives that curve away from high-risk areas
         val routes = mutableListOf<SafeRouteOption>()
@@ -256,16 +278,15 @@ class RiskZoneRepository(private val context: Context) {
         // Route 1: Direct path
         val directWaypoints = interpolateRoute(origin, destination, 10)
         val directCrimeRisk = evaluateRouteCrimeRisk(directWaypoints, crimeZones)
-        val directDisasterRisk = evaluateRouteDisasterRisk(directWaypoints, disasterZones)
-        val directWarnings = buildWarnings(directWaypoints, crimeZones, disasterZones)
+        val directWarnings = buildCrimeWarnings(directWaypoints, crimeZones)
 
         routes.add(
             SafeRouteOption(
                 name = "Direct Route",
                 waypoints = directWaypoints,
-                totalRiskScore = directCrimeRisk * 0.6f + directDisasterRisk * 0.4f,
+                totalRiskScore = directCrimeRisk,
                 crimeRisk = directCrimeRisk,
-                disasterRisk = directDisasterRisk,
+                disasterRisk = 0f,
                 distanceKm = directDistance,
                 warnings = directWarnings
             )
@@ -274,34 +295,32 @@ class RiskZoneRepository(private val context: Context) {
         // Route 2: Offset north/east to avoid risk zones
         val offset1 = generateOffsetRoute(origin, destination, 0.008, 10)
         val offset1Crime = evaluateRouteCrimeRisk(offset1, crimeZones)
-        val offset1Disaster = evaluateRouteDisasterRisk(offset1, disasterZones)
 
         routes.add(
             SafeRouteOption(
                 name = "Northern Alternative",
                 waypoints = offset1,
-                totalRiskScore = offset1Crime * 0.6f + offset1Disaster * 0.4f,
+                totalRiskScore = offset1Crime,
                 crimeRisk = offset1Crime,
-                disasterRisk = offset1Disaster,
+                disasterRisk = 0f,
                 distanceKm = directDistance * 1.15f,
-                warnings = buildWarnings(offset1, crimeZones, disasterZones)
+                warnings = buildCrimeWarnings(offset1, crimeZones)
             )
         )
 
         // Route 3: Offset south/west
         val offset2 = generateOffsetRoute(origin, destination, -0.008, 10)
         val offset2Crime = evaluateRouteCrimeRisk(offset2, crimeZones)
-        val offset2Disaster = evaluateRouteDisasterRisk(offset2, disasterZones)
 
         routes.add(
             SafeRouteOption(
                 name = "Southern Alternative",
                 waypoints = offset2,
-                totalRiskScore = offset2Crime * 0.6f + offset2Disaster * 0.4f,
+                totalRiskScore = offset2Crime,
                 crimeRisk = offset2Crime,
-                disasterRisk = offset2Disaster,
+                disasterRisk = 0f,
                 distanceKm = directDistance * 1.2f,
-                warnings = buildWarnings(offset2, crimeZones, disasterZones)
+                warnings = buildCrimeWarnings(offset2, crimeZones)
             )
         )
 
@@ -354,10 +373,9 @@ class RiskZoneRepository(private val context: Context) {
         return totalRisk.coerceIn(0f, 1f)
     }
 
-    private fun buildWarnings(
+    private fun buildCrimeWarnings(
         waypoints: List<LatLng>,
-        crimeZones: List<CrimeRiskZone>,
-        disasterZones: List<DisasterRiskZone>
+        crimeZones: List<CrimeRiskZone>
     ): List<String> {
         val warnings = mutableListOf<String>()
         val seenCities = mutableSetOf<String>()
@@ -367,18 +385,6 @@ class RiskZoneRepository(private val context: Context) {
                 if (zone.city !in seenCities && distanceMeters(point, zone.location) <= zone.radiusMeters) {
                     if (zone.crimeRiskScore >= 0.5f) {
                         warnings.add("⚠️ High crime area: ${zone.city} (${zone.totalCrimes} reported crimes)")
-                        seenCities.add(zone.city)
-                    }
-                }
-            }
-            for (zone in disasterZones) {
-                if (zone.city !in seenCities && distanceMeters(point, zone.location) <= zone.radiusMeters) {
-                    if (zone.floodRisk >= 0.5f) {
-                        warnings.add("🌊 Flood risk zone: ${zone.city}")
-                        seenCities.add(zone.city)
-                    }
-                    if (zone.landslideRisk >= 0.5f) {
-                        warnings.add("⛰️ Landslide risk: ${zone.city}")
                         seenCities.add(zone.city)
                     }
                 }
@@ -528,6 +534,7 @@ class RiskZoneRepository(private val context: Context) {
 
     companion object {
         private const val MASTER_DATASET_ASSET = "master_dataset.csv"
+        private const val LIVE_RISK_TTL_MILLIS = 15 * 60_000L
 
         fun distanceMeters(p1: LatLng, p2: LatLng): Float {
             val earthRadius = 6371000.0

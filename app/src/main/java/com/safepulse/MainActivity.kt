@@ -311,7 +311,6 @@ private fun AppDrawer(
                 null
             },
             DrawerDestination("risk_map", "Risk Map", Icons.Default.Map),
-            DrawerDestination("advanced_safety", "Advanced Safety", Icons.Default.Shield)
         ).filterNotNull()
     }
     val supportDestinations = remember {

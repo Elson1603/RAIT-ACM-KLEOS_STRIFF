@@ -20,15 +20,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.safepulse.data.security.PinVerificationResult
 import com.safepulse.domain.journey.JourneyPhase
 import com.safepulse.domain.journey.JourneySessionState
 import com.safepulse.domain.model.RiskLevel
 import com.safepulse.domain.model.SafetyMode
+import com.safepulse.service.BatteryDeadModeManager
+import com.safepulse.service.BatteryDeadModeState
 import com.safepulse.service.SafetyFeatureState
 import com.safepulse.service.WatchSyncUiState
 import com.safepulse.ui.components.LiveMapCard
@@ -56,7 +60,11 @@ fun HomeScreen(
     onOpenMenu: () -> Unit = {},
     viewModel: HomeViewModel = viewModel()
 ) {
+    val context = LocalContext.current
     val state by viewModel.state.collectAsState()
+    val batteryDeadModeManager = remember(context) { BatteryDeadModeManager.getInstance(context) }
+    val batteryDeadState by batteryDeadModeManager.state.collectAsState()
+    var showBatteryDeadConfirm by remember { mutableStateOf(false) }
     
     // Auto-scroll for tutorial
     val requesters = remember {
@@ -225,10 +233,15 @@ fun HomeScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            WatchSyncCard(
-                syncState = state.watchSync,
-                onCheckWatch = { viewModel.refreshWatchConnection() },
-                onSyncNow = { viewModel.syncWatchNow() }
+            DuressCancelPinHomeCard(
+                onCancelPin = { viewModel.handleCancelPin(it) }
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            BatteryDeadModeHomeCard(
+                state = batteryDeadState,
+                onEnable = { showBatteryDeadConfirm = true }
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -242,13 +255,6 @@ fun HomeScreen(
                 onOpenTimeline = onNavigateToJourneyTimeline,
                 onOpenCompanionJourney = onNavigateToCompanionJourney,
                 onOpenSafeRoutes = onNavigateToSafeRoutes
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            AdvancedSafetyEntryCard(
-                features = state.safetyFeatures,
-                onOpen = onNavigateToAdvancedSafety
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -369,6 +375,29 @@ fun HomeScreen(
             // Bottom padding for scroll
             Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+
+    if (showBatteryDeadConfirm) {
+        AlertDialog(
+            onDismissRequest = { showBatteryDeadConfirm = false },
+            title = { Text("Enable Battery Dead Mode?") },
+            text = { Text("Your phone will appear inactive while safety monitoring continues.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showBatteryDeadConfirm = false
+                        batteryDeadModeManager.activate("Enabled from Home")
+                    }
+                ) {
+                    Text("Enable")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBatteryDeadConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -592,7 +621,7 @@ private fun StatCard(
 }
 
 @Composable
-private fun WatchSyncCard(
+fun WatchSyncCard(
     syncState: WatchSyncUiState,
     onCheckWatch: () -> Unit,
     onSyncNow: () -> Unit
@@ -682,6 +711,134 @@ private fun WatchSyncCard(
                     Icon(Icons.Default.CloudSync, contentDescription = null)
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("Sync Now")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DuressCancelPinHomeCard(
+    onCancelPin: (String) -> PinVerificationResult,
+    modifier: Modifier = Modifier
+) {
+    var pin by remember { mutableStateOf("") }
+    var pinResult by remember { mutableStateOf<String?>(null) }
+
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Text("Duress Cancel PIN", fontWeight = FontWeight.Medium)
+            Text(
+                "Configured in Settings. Normal PIN cancels SOS; duress PIN keeps protection active silently.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = pin,
+                    onValueChange = { pin = it.filter(Char::isDigit).take(6) },
+                    label = { Text("PIN") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true
+                )
+                Button(
+                    onClick = {
+                        pinResult = when (onCancelPin(pin)) {
+                            PinVerificationResult.NORMAL_CANCELLED,
+                            PinVerificationResult.DURESS_ACTIVATED,
+                            PinVerificationResult.DISABLED_CANCELLED -> "SOS cancelled successfully"
+                            PinVerificationResult.INVALID -> "Invalid PIN"
+                        }
+                        pin = ""
+                    },
+                    enabled = pin.isNotBlank(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryRed)
+                ) {
+                    Text("Apply")
+                }
+            }
+
+            pinResult?.let {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (it.contains("successfully")) SafeGreen else WarningYellow
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatteryDeadModeHomeCard(
+    state: BatteryDeadModeState,
+    onEnable: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.Battery0Bar,
+                    contentDescription = null,
+                    tint = if (state.isEnabled) SafeGreen else WarningYellow,
+                    modifier = Modifier.size(30.dp)
+                )
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Fake Battery Dead Mode", fontWeight = FontWeight.Medium)
+                    Text(
+                        if (state.isEnabled) {
+                            "Overlay active. Protection continues silently."
+                        } else {
+                            "Make the phone appear inactive while protection continues."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            if (state.isEnabled) {
+                OutlinedButton(
+                    onClick = {},
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("Overlay Active")
+                }
+            } else {
+                Button(
+                    onClick = onEnable,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryRed)
+                ) {
+                    Text("Enable Battery Dead Mode")
                 }
             }
         }

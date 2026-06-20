@@ -37,13 +37,9 @@ import com.safepulse.ui.map.*
 private val HighRiskColor = Color(0xFFF44336)
 private val MediumRiskColor = Color(0xFFFF9800)
 private val LowRiskColor = Color(0xFF4CAF50)
-private val FloodColor = Color(0xFF2196F3)
-private val LandslideColor = Color(0xFF795548)
 private val SafeRouteColor = Color(0xFF4CAF50)
 private val UnsafeRouteColor = Color(0xFFF44336)
 private val AltRouteColor = Color(0xFFFF9800)
-private val PoliceColor = Color(0xFF1565C0)
-private val HospitalColor = Color(0xFFD32F2F)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -55,7 +51,6 @@ fun RiskMapScreen(
     val uiState by viewModel.uiState.collectAsState()
     val currentLocation by viewModel.currentLocation.collectAsState()
     val locationRisk by viewModel.locationRisk.collectAsState()
-    val selectedFilter by viewModel.selectedFilter.collectAsState()
     val safeRoutes by viewModel.safeRoutes.collectAsState()
     val destination by viewModel.destination.collectAsState()
     val safetyPlaces by viewModel.safetyPlaces.collectAsState()
@@ -99,11 +94,11 @@ fun RiskMapScreen(
     }
 
     // Update map overlays when data or filter changes
-    LaunchedEffect(uiState, selectedFilter, safeRoutes, destination, showSafetyPlaces, safetyPlaces, mapController) {
+    LaunchedEffect(uiState, safeRoutes, destination, showSafetyPlaces, safetyPlaces, mapController) {
         val ctrl = mapController ?: return@LaunchedEffect
         val state = uiState as? RiskMapUiState.Success ?: return@LaunchedEffect
         drawRiskOverlays(
-            ctrl, state.riskData, selectedFilter, safeRoutes,
+            ctrl, state.riskData, safeRoutes,
             currentLocation, destination,
             if (showSafetyPlaces) safetyPlaces else emptyList(),
             crimeZonesForMap
@@ -235,15 +230,6 @@ fun RiskMapScreen(
                 }
             }
 
-            // Filter chips at top
-            FilterChipsRow(
-                selectedFilter = selectedFilter,
-                onFilterChanged = { viewModel.setFilter(it) },
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 8.dp)
-            )
-
             // Loading
             if (uiState is RiskMapUiState.Loading) {
                 CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
@@ -292,37 +278,6 @@ fun RiskMapScreen(
 }
 
 @Composable
-private fun FilterChipsRow(
-    selectedFilter: RiskFilter,
-    onFilterChanged: (RiskFilter) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        RiskFilter.values().forEach { filter ->
-            FilterChip(
-                selected = filter == selectedFilter,
-                onClick = { onFilterChanged(filter) },
-                label = {
-                    Text(
-                        when (filter) {
-                            RiskFilter.ALL -> "All Risks"
-                            RiskFilter.CRIME_ONLY -> "🔴 Crime"
-                            RiskFilter.DISASTER_ONLY -> "🌊 Disaster"
-                        },
-                        fontSize = 12.sp
-                    )
-                }
-            )
-        }
-    }
-}
-
-@Composable
 private fun MapLegend(modifier: Modifier = Modifier) {
     Card(
         modifier = modifier,
@@ -336,10 +291,6 @@ private fun MapLegend(modifier: Modifier = Modifier) {
             LegendItem(HighRiskColor, "High Crime Risk")
             LegendItem(MediumRiskColor, "Medium Crime Risk")
             LegendItem(LowRiskColor, "Low Crime Risk")
-            LegendItem(FloodColor, "Flood Risk")
-            LegendItem(LandslideColor, "Landslide Risk")
-            LegendItem(PoliceColor, "🚔 Police Station")
-            LegendItem(HospitalColor, "🏥 Hospital")
         }
     }
 }
@@ -384,7 +335,7 @@ private fun RiskInfoPanel(
         ) {
             // Location risk summary
             locationRisk?.let { risk ->
-                Text("📍 Your Area Risk Analysis", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Text("Your Area Crime Analysis", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 Spacer(Modifier.height(8.dp))
 
                 Row(
@@ -392,14 +343,6 @@ private fun RiskInfoPanel(
                     horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
                     RiskScoreChip("Crime", risk.crimeRisk, HighRiskColor)
-                    RiskScoreChip("Disaster", risk.disasterRisk, FloodColor)
-                    RiskScoreChip("Overall", risk.overallRisk,
-                        when {
-                            risk.overallRisk >= 0.7f -> HighRiskColor
-                            risk.overallRisk >= 0.4f -> MediumRiskColor
-                            else -> LowRiskColor
-                        }
-                    )
                 }
 
                 // Nearby zones
@@ -415,18 +358,6 @@ private fun RiskInfoPanel(
                     }
                 }
 
-                if (risk.nearbyDisasterZones.isNotEmpty()) {
-                    Spacer(Modifier.height(4.dp))
-                    Text("Nearby Disaster Zones:", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                    risk.nearbyDisasterZones.take(3).forEach { zone ->
-                        val factors = zone.riskFactors.take(2).joinToString(", ")
-                        Text(
-                            "• ${zone.city}: $factors",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
             }
 
             // Safe route section — show only the safest
@@ -518,9 +449,8 @@ private fun SafeRouteCard(route: SafeRouteOption, onClick: () -> Unit) {
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("📏 ${String.format("%.1f", route.distanceKm)} km", fontSize = 11.sp)
-                Text("🔴 Crime: ${(route.crimeRisk * 100).toInt()}%", fontSize = 11.sp)
-                Text("🌊 Disaster: ${(route.disasterRisk * 100).toInt()}%", fontSize = 11.sp)
+                Text("${String.format("%.1f", route.distanceKm)} km", fontSize = 11.sp)
+                Text("Crime: ${(route.crimeRisk * 100).toInt()}%", fontSize = 11.sp)
             }
             if (route.warnings.isNotEmpty()) {
                 Spacer(Modifier.height(4.dp))
@@ -639,7 +569,6 @@ private fun DestinationInputDialog(
 private fun drawRiskOverlays(
     ctrl: LeafletMapController,
     riskData: CombinedRiskData,
-    filter: RiskFilter,
     safeRoutes: List<SafeRouteOption>,
     currentLocation: LatLng?,
     destination: LatLng?,
@@ -660,74 +589,29 @@ private fun drawRiskOverlays(
         )
         .take(MAX_RISK_ZONE_MARKERS)
         .toList()
-    val visibleDisasterZones = riskData.disasterZones
-        .asSequence()
-        .filter { zone -> distanceKm(mapCenter, zone.location) <= RISK_MAP_RADIUS_KM || zone.combinedDisasterRisk >= 0.75f }
-        .sortedWith(
-            compareByDescending<DisasterRiskZone> { it.combinedDisasterRisk }
-                .thenBy { distanceKm(mapCenter, it.location) }
-        )
-        .take(MAX_DISASTER_ZONE_MARKERS)
-        .toList()
-
     // Crime risk circles & hotspot markers
-    if (filter == RiskFilter.ALL || filter == RiskFilter.CRIME_ONLY) {
-        for (zone in visibleCrimeZones) {
-            val (fill, stroke) = when {
-                zone.crimeRiskScore >= 0.5f -> "#F44336" to "#F44336"
-                zone.crimeRiskScore >= 0.2f -> "#FF9800" to "#FF9800"
-                else -> "#4CAF50" to "#4CAF50"
-            }
-            circles.add(CircleData(
-                zone.location.latitude, zone.location.longitude,
-                zone.radiusMeters.toDouble(), fill, stroke, 0.25, 0.5
-            ))
-            for (hotspot in zone.hotspots) {
-                val color = when {
-                    hotspot.risk >= 0.7f -> "#F44336"
-                    hotspot.risk >= 0.4f -> "#FF9800"
-                    else -> "#4CAF50"
-                }
-                markers.add(MarkerData(
-                    hotspot.location.latitude, hotspot.location.longitude,
-                    "\uD83D\uDD34 ${hotspot.label}",
-                    "Crime Risk: ${(hotspot.risk * 100).toInt()}% | ${zone.city}",
-                    color
-                ))
-            }
+    for (zone in visibleCrimeZones) {
+        val (fill, stroke) = when {
+            zone.crimeRiskScore >= 0.5f -> "#F44336" to "#F44336"
+            zone.crimeRiskScore >= 0.2f -> "#FF9800" to "#FF9800"
+            else -> "#4CAF50" to "#4CAF50"
         }
-    }
-
-    // Disaster risk circles & markers
-    if (filter == RiskFilter.ALL || filter == RiskFilter.DISASTER_ONLY) {
-        for (zone in visibleDisasterZones) {
-            if (zone.floodRisk >= 0.4f) {
-                circles.add(CircleData(
-                    zone.location.latitude, zone.location.longitude,
-                    zone.radiusMeters.toDouble() * 0.8, "#2196F3", "#2196F3", 0.2, 0.4
-                ))
+        circles.add(CircleData(
+            zone.location.latitude, zone.location.longitude,
+            zone.radiusMeters.toDouble(), fill, stroke, 0.25, 0.5
+        ))
+        for (hotspot in zone.hotspots) {
+            val color = when {
+                hotspot.risk >= 0.7f -> "#F44336"
+                hotspot.risk >= 0.4f -> "#FF9800"
+                else -> "#4CAF50"
             }
-            if (zone.landslideRisk >= 0.4f) {
-                circles.add(CircleData(
-                    zone.location.latitude, zone.location.longitude,
-                    zone.radiusMeters.toDouble() * 0.6, "#795548", "#795548", 0.2, 0.4
-                ))
-            }
-            if (zone.combinedDisasterRisk >= 0.4f) {
-                val typeLabel = when {
-                    zone.floodRisk >= 0.5f && zone.landslideRisk >= 0.5f -> "\uD83C\uDF0A\u26F0\uFE0F Multi-hazard"
-                    zone.floodRisk >= 0.5f -> "\uD83C\uDF0A Flood Risk"
-                    zone.landslideRisk >= 0.5f -> "\u26F0\uFE0F Landslide Risk"
-                    else -> "\u26A0\uFE0F Disaster Risk"
-                }
-                val bgColor = if (zone.floodRisk > zone.landslideRisk) "#2196F3" else "#795548"
-                markers.add(MarkerData(
-                    zone.location.latitude, zone.location.longitude,
-                    "$typeLabel - ${zone.city}",
-                    zone.riskFactors.take(2).joinToString(" \u2022 "),
-                    bgColor
-                ))
-            }
+            markers.add(MarkerData(
+                hotspot.location.latitude, hotspot.location.longitude,
+                "\uD83D\uDD34 ${hotspot.label}",
+                "Crime Risk: ${(hotspot.risk * 100).toInt()}% | ${zone.city}",
+                color
+            ))
         }
     }
 
@@ -796,4 +680,3 @@ private fun distanceKm(p1: LatLng, p2: LatLng): Double {
 
 private const val RISK_MAP_RADIUS_KM = 85.0
 private const val MAX_RISK_ZONE_MARKERS = 120
-private const val MAX_DISASTER_ZONE_MARKERS = 40

@@ -29,9 +29,6 @@ class RiskMapViewModel(
     private val _safeRoutes = MutableStateFlow<List<SafeRouteOption>>(emptyList())
     val safeRoutes: StateFlow<List<SafeRouteOption>> = _safeRoutes.asStateFlow()
 
-    private val _selectedFilter = MutableStateFlow(RiskFilter.ALL)
-    val selectedFilter: StateFlow<RiskFilter> = _selectedFilter.asStateFlow()
-
     private val _locationRisk = MutableStateFlow<LocationRiskInfo?>(null)
     val locationRisk: StateFlow<LocationRiskInfo?> = _locationRisk.asStateFlow()
 
@@ -61,7 +58,7 @@ class RiskMapViewModel(
     fun loadRiskData() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val data = riskZoneRepository.loadAllRiskData()
+                val data = riskZoneRepository.loadLiveRiskDataPreferred()
                 _uiState.value = RiskMapUiState.Success(data)
                 val loc = _currentLocation.value
                 val center = loc ?: LatLng(28.6139, 77.2090)
@@ -91,23 +88,16 @@ class RiskMapViewModel(
         _currentLocation.value = location
         viewModelScope.launch(Dispatchers.IO) {
             val crimeRisk = riskZoneRepository.computeCrimeRisk(location)
-            val disasterRisk = riskZoneRepository.computeDisasterRisk(location)
-            val overallRisk = riskZoneRepository.computeRiskAtLocation(location)
-
             val nearbyCrime = riskZoneRepository.getCrimeZonesNear(location, 15.0)
-            val nearbyDisaster = riskZoneRepository.getDisasterZonesNear(location, 15.0)
 
             _locationRisk.value = LocationRiskInfo(
-                overallRisk = overallRisk,
                 crimeRisk = crimeRisk,
-                disasterRisk = disasterRisk,
                 riskLevel = when {
-                    overallRisk >= 0.7f -> "HIGH"
-                    overallRisk >= 0.4f -> "MEDIUM"
+                    crimeRisk >= 0.7f -> "HIGH"
+                    crimeRisk >= 0.4f -> "MEDIUM"
                     else -> "LOW"
                 },
-                nearbyCrimeZones = nearbyCrime.take(5),
-                nearbyDisasterZones = nearbyDisaster.take(5)
+                nearbyCrimeZones = nearbyCrime.take(5)
             )
 
             _safetyPlaces.value = riskZoneRepository.getSafetyPlacesNear(location, 30.0)
@@ -119,10 +109,6 @@ class RiskMapViewModel(
                 .take(MAX_SAFE_ZONE_MARKERS)
             _crimeZonesForMap.value = riskZoneRepository.getCrimeZonesForMapNear(location)
         }
-    }
-
-    fun setFilter(filter: RiskFilter) {
-        _selectedFilter.value = filter
     }
 
     fun searchSafeRoute(destinationLatLng: LatLng) {
@@ -153,17 +139,10 @@ sealed class RiskMapUiState {
     data class Error(val message: String) : RiskMapUiState()
 }
 
-enum class RiskFilter {
-    ALL, CRIME_ONLY, DISASTER_ONLY
-}
-
 data class LocationRiskInfo(
-    val overallRisk: Float,
     val crimeRisk: Float,
-    val disasterRisk: Float,
     val riskLevel: String,
-    val nearbyCrimeZones: List<CrimeRiskZone>,
-    val nearbyDisasterZones: List<DisasterRiskZone>
+    val nearbyCrimeZones: List<CrimeRiskZone>
 )
 
 class RiskMapViewModelFactory(
